@@ -19,8 +19,11 @@
 org.apache.skywalking.apm.agent.core.remote.TraceSegmentServiceClient
 org.apache.skywalking.apm.agent.core.context.ContextManager
 org.apache.skywalking.apm.agent.core.sampling.SamplingService
+# 建立连接
 org.apache.skywalking.apm.agent.core.remote.GRPCChannelManager
+# 收集、发送jvm信息指标
 org.apache.skywalking.apm.agent.core.jvm.JVMService
+# 服务注册
 org.apache.skywalking.apm.agent.core.remote.ServiceAndEndpointRegisterClient
 org.apache.skywalking.apm.agent.core.context.ContextManagerExtendService
 org.apache.skywalking.apm.agent.core.commands.CommandService

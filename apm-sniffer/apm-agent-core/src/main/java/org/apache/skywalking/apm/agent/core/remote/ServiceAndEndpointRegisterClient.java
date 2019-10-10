@@ -83,8 +83,10 @@ public class ServiceAndEndpointRegisterClient implements BootService, Runnable, 
 
     @Override
     public void prepare() throws Throwable {
+
         ServiceManager.INSTANCE.findService(GRPCChannelManager.class).addChannelListener(this);
 
+        //生成实例id
         INSTANCE_UUID = StringUtil.isEmpty(Config.Agent.INSTANCE_UUID) ? UUID.randomUUID().toString()
             .replaceAll("-", "") : Config.Agent.INSTANCE_UUID;
 

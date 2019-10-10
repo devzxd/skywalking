@@ -18,9 +18,19 @@
 
 package org.apache.skywalking.apm.plugin.spring.mvc.commons.interceptor;
 
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.lang.reflect.Method;
+import javax.servlet.ServletException;
 import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
+
+import com.alibaba.csp.sentinel.Entry;
+import com.alibaba.csp.sentinel.EntryType;
+import com.alibaba.csp.sentinel.SphU;
+import com.alibaba.csp.sentinel.Tracer;
+import com.alibaba.csp.sentinel.context.ContextUtil;
+import com.alibaba.csp.sentinel.slots.block.BlockException;
 import org.apache.skywalking.apm.agent.core.conf.Config;
 import org.apache.skywalking.apm.agent.core.context.CarrierItem;
 import org.apache.skywalking.apm.agent.core.context.ContextCarrier;
@@ -28,14 +38,18 @@ import org.apache.skywalking.apm.agent.core.context.ContextManager;
 import org.apache.skywalking.apm.agent.core.context.tag.Tags;
 import org.apache.skywalking.apm.agent.core.context.trace.AbstractSpan;
 import org.apache.skywalking.apm.agent.core.context.trace.SpanLayer;
+import org.apache.skywalking.apm.agent.core.logging.api.ILog;
+import org.apache.skywalking.apm.agent.core.logging.api.LogManager;
 import org.apache.skywalking.apm.agent.core.plugin.interceptor.enhance.EnhancedInstance;
 import org.apache.skywalking.apm.agent.core.plugin.interceptor.enhance.InstanceMethodsAroundInterceptor;
 import org.apache.skywalking.apm.agent.core.plugin.interceptor.enhance.MethodInterceptResult;
+import org.apache.skywalking.apm.agent.core.remote.ServiceAndEndpointRegisterClient;
 import org.apache.skywalking.apm.agent.core.util.MethodUtil;
 import org.apache.skywalking.apm.network.trace.component.ComponentsDefine;
 import org.apache.skywalking.apm.plugin.spring.mvc.commons.EnhanceRequireObjectCache;
 import org.apache.skywalking.apm.plugin.spring.mvc.commons.exception.IllegalMethodStackDepthException;
 import org.apache.skywalking.apm.plugin.spring.mvc.commons.exception.ServletResponseNotFoundException;
+import org.springframework.util.StringUtils;
 
 import static org.apache.skywalking.apm.plugin.spring.mvc.commons.Constants.CONTROLLER_METHOD_STACK_DEPTH;
 import static org.apache.skywalking.apm.plugin.spring.mvc.commons.Constants.FORWARD_REQUEST_FLAG;
@@ -46,7 +60,7 @@ import static org.apache.skywalking.apm.plugin.spring.mvc.commons.Constants.RESP
  * the abstract method interceptor
  */
 public abstract class AbstractMethodInterceptor implements InstanceMethodsAroundInterceptor {
-
+    private static final ILog logger = LogManager.getLogger(AbstractMethodInterceptor.class);
     private static boolean IS_SERVLET_GET_STATUS_METHOD_EXIST;
     private static final String SERVLET_RESPONSE_CLASS = "javax.servlet.http.HttpServletResponse";
     private static final String GET_STATUS_METHOD = "getStatus";
@@ -61,9 +75,9 @@ public abstract class AbstractMethodInterceptor implements InstanceMethodsAround
 
     @Override
     public void beforeMethod(EnhancedInstance objInst, Method method, Object[] allArguments, Class<?>[] argumentsTypes,
-        MethodInterceptResult result) throws Throwable {
+                             MethodInterceptResult result) throws Throwable {
 
-        Boolean forwardRequestFlag = (Boolean)ContextManager.getRuntimeContext().get(FORWARD_REQUEST_FLAG);
+        Boolean forwardRequestFlag = (Boolean) ContextManager.getRuntimeContext().get(FORWARD_REQUEST_FLAG);
         /**
          * Spring MVC plugin do nothing if current request is forward request.
          * Ref: https://github.com/apache/skywalking/pull/1325
@@ -76,7 +90,7 @@ public abstract class AbstractMethodInterceptor implements InstanceMethodsAround
         if (Config.Plugin.SpringMVC.USE_QUALIFIED_NAME_AS_ENDPOINT_NAME) {
             operationName = MethodUtil.generateOperationName(method);
         } else {
-            EnhanceRequireObjectCache pathMappingCache = (EnhanceRequireObjectCache)objInst.getSkyWalkingDynamicField();
+            EnhanceRequireObjectCache pathMappingCache = (EnhanceRequireObjectCache) objInst.getSkyWalkingDynamicField();
             String requestURL = pathMappingCache.findPathMapping(method);
             if (requestURL == null) {
                 requestURL = getRequestURL(method);
@@ -86,9 +100,9 @@ public abstract class AbstractMethodInterceptor implements InstanceMethodsAround
             operationName = requestURL;
         }
 
-        HttpServletRequest request = (HttpServletRequest)ContextManager.getRuntimeContext().get(REQUEST_KEY_IN_RUNTIME_CONTEXT);
+        HttpServletRequest request = (HttpServletRequest) ContextManager.getRuntimeContext().get(REQUEST_KEY_IN_RUNTIME_CONTEXT);
         if (request != null) {
-            StackDepth stackDepth = (StackDepth)ContextManager.getRuntimeContext().get(CONTROLLER_METHOD_STACK_DEPTH);
+            StackDepth stackDepth = (StackDepth) ContextManager.getRuntimeContext().get(CONTROLLER_METHOD_STACK_DEPTH);
 
             if (stackDepth == null) {
                 ContextCarrier contextCarrier = new ContextCarrier();
@@ -108,17 +122,81 @@ public abstract class AbstractMethodInterceptor implements InstanceMethodsAround
                 ContextManager.getRuntimeContext().put(CONTROLLER_METHOD_STACK_DEPTH, stackDepth);
             } else {
                 AbstractSpan span =
-                    ContextManager.createLocalSpan(buildOperationName(objInst, method));
+                        ContextManager.createLocalSpan(buildOperationName(objInst, method));
                 span.setComponent(ComponentsDefine.SPRING_MVC_ANNOTATION);
             }
 
             stackDepth.increment();
         }
+        System.out.println("访问路径：" + operationName);
+        if (request != null) {
+            Entry entry = null;
+            try {
+                String ip = request.getHeader("ip");
+                String app = request.getHeader("referer");
+                String inst = request.getHeader("inst");
+                //校验黑白名单规则
+                String ipOrigin = StringUtils.isEmpty(ip) ? null : "ip::" + ip;
+                String appOrigin = StringUtils.isEmpty(app) ? null : "app::" + app.toLowerCase();
+                String instOrigin = StringUtils.isEmpty(inst) ? null : "inst::" + inst.toLowerCase();
+                StringBuilder builder = new StringBuilder();
+                if (ipOrigin != null) {
+                    builder.append(ipOrigin);
+                    builder.append(",");
+                }
+                if (appOrigin != null) {
+                    builder.append(appOrigin);
+                    builder.append(",");
+                }
+                if (instOrigin != null) {
+                    builder.append(instOrigin);
+                    builder.append(",");
+                }
+                String origin = "";
+                if (builder.length() > 0) {
+                    origin = builder.toString().substring(0, builder.length() - 1);
+                }
+                ContextUtil.enter(operationName, origin);
+                entry = SphU.entry(operationName, EntryType.IN, 1, inst, ip, app);
+            } catch (BlockException e) {
+                result.defineReturnValue(null);
+                String rootTraceId = request.getHeader("rtid");
+//                log.info("请求被限流，traceId:{},限流规则：{}", rootTraceId, JSON.toJSONString(e));
+                // Return the block page, or redirect to another URL.
+                System.out.println("限流了！！！");
+                logger.info("{}被限流了",operationName);
+                logger.debug("{}被限流了",operationName);
+                HttpServletResponse response = (HttpServletResponse) ContextManager.getRuntimeContext().get(RESPONSE_KEY_IN_RUNTIME_CONTEXT);
+                response.setContentType("text/html;charset=utf-8");
+                response.setStatus(429);
+                PrintWriter out = response.getWriter();
+                out.print("请求被限流");
+                out.flush();
+                out.close();
+//            WebCallbackManager.getUrlBlockHandler().blocked(httpServletRequest, httpServletResponse, e);
+            } catch (RuntimeException e4) {
+                Tracer.trace(e4);
+                throw e4;
+            } finally {
+                if (entry != null) {
+                    entry.exit();
+                }
+                ContextUtil.exit();
+            }
+        }
+
+//        HttpServletResponse response = (HttpServletResponse) ContextManager.getRuntimeContext().get(RESPONSE_KEY_IN_RUNTIME_CONTEXT);
+//        response.setContentType("text/html;charset=utf-8");
+//        response.setStatus(429);
+//        PrintWriter out = response.getWriter();
+//        out.print("请求被限流");
+//        out.flush();
+//        out.close();
     }
 
     private String buildOperationName(Object invoker, Method method) {
         StringBuilder operationName = new StringBuilder(invoker.getClass().getName())
-            .append(".").append(method.getName()).append("(");
+                .append(".").append(method.getName()).append("(");
         for (Class<?> type : method.getParameterTypes()) {
             operationName.append(type.getName()).append(",");
         }
@@ -132,8 +210,8 @@ public abstract class AbstractMethodInterceptor implements InstanceMethodsAround
 
     @Override
     public Object afterMethod(EnhancedInstance objInst, Method method, Object[] allArguments, Class<?>[] argumentsTypes,
-        Object ret) throws Throwable {
-        Boolean forwardRequestFlag = (Boolean)ContextManager.getRuntimeContext().get(FORWARD_REQUEST_FLAG);
+                              Object ret) throws Throwable {
+        Boolean forwardRequestFlag = (Boolean) ContextManager.getRuntimeContext().get(FORWARD_REQUEST_FLAG);
         /**
          * Spring MVC plugin do nothing if current request is forward request.
          * Ref: https://github.com/apache/skywalking/pull/1325
@@ -142,10 +220,10 @@ public abstract class AbstractMethodInterceptor implements InstanceMethodsAround
             return ret;
         }
 
-        HttpServletRequest request = (HttpServletRequest)ContextManager.getRuntimeContext().get(REQUEST_KEY_IN_RUNTIME_CONTEXT);
+        HttpServletRequest request = (HttpServletRequest) ContextManager.getRuntimeContext().get(REQUEST_KEY_IN_RUNTIME_CONTEXT);
 
         if (request != null) {
-            StackDepth stackDepth = (StackDepth)ContextManager.getRuntimeContext().get(CONTROLLER_METHOD_STACK_DEPTH);
+            StackDepth stackDepth = (StackDepth) ContextManager.getRuntimeContext().get(CONTROLLER_METHOD_STACK_DEPTH);
             if (stackDepth == null) {
                 throw new IllegalMethodStackDepthException();
             } else {
@@ -155,7 +233,7 @@ public abstract class AbstractMethodInterceptor implements InstanceMethodsAround
             AbstractSpan span = ContextManager.activeSpan();
 
             if (stackDepth.depth() == 0) {
-                HttpServletResponse response = (HttpServletResponse)ContextManager.getRuntimeContext().get(RESPONSE_KEY_IN_RUNTIME_CONTEXT);
+                HttpServletResponse response = (HttpServletResponse) ContextManager.getRuntimeContext().get(RESPONSE_KEY_IN_RUNTIME_CONTEXT);
                 if (response == null) {
                     throw new ServletResponseNotFoundException();
                 }
@@ -178,7 +256,7 @@ public abstract class AbstractMethodInterceptor implements InstanceMethodsAround
 
     @Override
     public void handleMethodException(EnhancedInstance objInst, Method method, Object[] allArguments,
-        Class<?>[] argumentsTypes, Throwable t) {
+                                      Class<?>[] argumentsTypes, Throwable t) {
         ContextManager.activeSpan().errorOccurred().log(t);
     }
 }
